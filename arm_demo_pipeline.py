@@ -214,6 +214,7 @@ def run_pipeline(
     print("  [Mouse Drag]: Click & drag any object on the tabletop to variable (X, Y) coordinates!")
     print("  [N]         : Randomize tabletop object coordinates & make AI re-identify and get ready")
     print("  [1..6]      : Quick variable objects: [1] Red Bottle [2] Foam Board [3] Green Block [4] Yellow Cup [5] Black Phone [6] Desk Photo")
+    print("  [O]         : Run Deep OWLv2 Transformer Scan on current Live Webcam frame")
     print("  [S]         : Toggle Live Webcam / Synthetic Simulation Feed")
     print("  [R]         : Reset Arm & Objects to Home Pose")
     print("  [Q / ESC]   : Quit Demo")
@@ -492,6 +493,16 @@ def run_pipeline(
                     print(f"\n[Preset] Loaded Real Desk Photo {p_path}: {task}")
                     pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(static_frame)
                     start_get_ready()
+
+            elif key in (ord("o"), ord("O")):
+                print("\n[OWLv2 Deep Scan] Running Open-Vocabulary Vision Transformer on current frame...")
+                os.environ["USE_OWLV2"] = "1"
+                try:
+                    frame = static_frame.copy() if static_frame is not None else detector.get_frame()
+                    pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
+                    start_get_ready()
+                finally:
+                    os.environ["USE_OWLV2"] = "0"
 
             elif key in (ord("r"), ord("R")):
                 arm_state = "IDLE"

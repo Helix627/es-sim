@@ -360,6 +360,9 @@ class VisionDetector:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
             self.cap.set(cv2.CAP_PROP_FPS, config.FPS)
+            # Warm up auto-exposure on real webcam
+            for _ in range(5):
+                self.cap.read()
         else:
             print("[Vision] Webcam not available. Using synthetic simulation mode.")
             self.use_simulation = True
@@ -815,8 +818,8 @@ class VisionDetector:
         for cname in ["red", "blue", "green", "yellow", "orange", "white", "black", "grey"]:
             if cname in q or (cname == "grey" and "gray" in q):
                 c_ratio = f.get(cname, 0.0)
-                if c_ratio > 0.15:
-                    score = 0.65 + 0.34 * min(1.0, c_ratio / 0.55)
+                if c_ratio > 0.10:
+                    score = 0.62 + 0.37 * min(1.0, c_ratio / 0.50)
                     dom_color = cname
                     reason = f"Matched {cname} object ({c_ratio*100:.0f}% {cname} pixels in region)."
                 else:
@@ -825,7 +828,7 @@ class VisionDetector:
 
         cx, cy = prop["center"]
         dist_center = np.hypot((cx - img_w * 0.5) / img_w, (cy - img_h * 0.5) / img_h)
-        score = max(0.20, 0.65 - 0.5 * float(dist_center))
+        score = max(0.38, 0.72 - 0.45 * float(dist_center))
         return round(score, 2), dom_color, reason
 
     def find_sim_object_key_for_query_match(self, query: str) -> Optional[str]:
@@ -902,7 +905,7 @@ class VisionDetector:
             if len(merged) >= 8:
                 break
 
-        best = merged[0] if merged else None
+        best = merged[0] if (merged and merged[0].score >= 0.35) else None
         return best, merged
 
     def detect_objects_by_color(
