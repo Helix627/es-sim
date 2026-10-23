@@ -3,18 +3,18 @@
 AI-POWERED VISION-GUIDED ROBOTIC ARM - COMPLETE SOFTWARE PROTOTYPE
 ========================================================================================
 Integrates:
-  1. Variable Object & Natural Language Command Understanding (Open-Vocabulary)
-  2. Open-Vocabulary Object Grounding (OWLv2 + Multi-Cue Tabletop Vision)
+  1. Manual Naming of BOTH Pick Object & Place Object (`[T]` 2-step wizard, `[P]` Pick
+     name, `[L]` Place name, `[C]` terminal prompt, or `--pick` / `--place` CLI flags)
+  2. Open-Vocabulary Object Grounding (OWLv2 + Multi-Cue Tabletop Vision) for both
+     the object to pick up AND the target object/surface where it should be placed
   3. 2D-to-3D Tabletop Coordinate Estimation (Robot Base Frame X, Y, Z in cm)
   4. 5-DOF Analytical Inverse Kinematics (t1..t4 & ESP32 Servos B, S, E, W, C)
   5. Two-Stage Autonomous Workflow:
-       - Stage 1 (IDENTIFY & GET READY): AI identifies any variable object, calculates
-         3D coordinates & joint angles, and moves the arm to the APPROACH_PICK hover
-         pose right above the target object ("READY TO MOVE").
+       - Stage 1 (IDENTIFY & GET READY): AI identifies both the Pick object and Place
+         object, calculates 3D coordinates & joint angles, and moves the arm to the
+         APPROACH_PICK hover pose right above the Pick object ("READY TO MOVE").
        - Stage 2 (EXECUTE MOVE): Pressing [SPACE] executes the grasp, lift, transit,
-         and placement into the destination tray.
-  6. Interactive Tabletop: Type ANY object name on-screen ([T]), drag-and-drop objects
-     with the mouse to variable (X, Y) coordinates, or press [N] to randomize positions.
+         and placement onto the manually named Place object.
 ========================================================================================
 """
 import os
@@ -22,6 +22,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
+from typing import Optional
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -44,18 +45,26 @@ from visualizer import DashboardVisualizer
 
 def run_pipeline(
     query: str = "Pick up the red bottle and place it in the blue tray.",
+    pick_manual: Optional[str] = None,
+    place_manual: Optional[str] = None,
     image_path_str: str = "",
     webcam_index: int = 0,
     use_simulation: bool = False,
     headless: bool = False,
 ):
     print("=" * 108)
-    print(" AI-POWERED VISION-GUIDED ROBOTIC ARM - VARIABLE OBJECT PROTOTYPE")
+    print(" AI-POWERED VISION-GUIDED ROBOTIC ARM - VARIABLE PICK & PLACE PROTOTYPE")
     print("=" * 108)
-    print(f"[Command] \"{query}\"")
 
     cmd_parser = CommandParser()
-    task = cmd_parser.parse(query)
+    if pick_manual or place_manual:
+        p_str = pick_manual or "red bottle"
+        d_str = place_manual or "blue tray"
+        task = cmd_parser.create_task(p_str, d_str)
+    else:
+        task = cmd_parser.parse(query)
+
+    print(f"[Command] \"{task.raw_command}\"")
     print(f"[NLP]     {task}")
 
     calibrator = WorkspaceCalibrator()
@@ -91,24 +100,33 @@ def run_pipeline(
     print("-" * 108)
 
     def ensure_variable_sim_objects():
-        """Ensures any user-requested variable object exists on the simulated tabletop."""
+        """Ensures both manually named Pick and Place objects exist on the simulated tabletop."""
         if detector.use_simulation and static_frame is None:
-            detector.ensure_sim_object_for_query(task.pick_phrase, is_receptacle=False)
+            if task.pick_phrase:
+                detector.ensure_sim_object_for_query(task.pick_phrase, is_receptacle=False)
             if task.place_phrase:
                 detector.ensure_sim_object_for_query(task.place_phrase, is_receptacle=True)
 
     def detect_and_plan(frame: np.ndarray):
         t0 = time.perf_counter()
-        pick_obj, candidates = detector.locate_by_query(frame, task.pick_phrase)
+        pick_obj, candidates = detector.locate_by_query(
+            frame, task.pick_phrase, is_receptacle=False
+        )
 
         place_obj = None
+        place_candidates = []
         if task.place_phrase:
             exclude = pick_obj.bbox if pick_obj else None
-            place_obj, _ = detector.locate_by_query(frame, task.place_phrase, exclude_bbox=exclude)
+            place_obj, place_candidates = detector.locate_by_query(
+                frame, task.place_phrase, exclude_bbox=exclude, is_receptacle=True
+            )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        print(f"\n[Vision AI] Variable Object Search for '{task.pick_phrase}' completed in {elapsed_ms:.1f} ms ({len(candidates)} objects detected):")
+        print(
+            f"\n[Vision AI] Scene Scan for Pick='{task.pick_phrase}' & Place='{task.place_phrase or 'Drop Zone'}' "
+            f"completed in {elapsed_ms:.1f} ms ({len(candidates)} objects detected):"
+        )
         for idx, cand in enumerate(candidates, start=1):
             bx0, by0, bx1, by1 = cand.box_xyxy
             rx, ry, rz = cand.robot_coords
@@ -118,36 +136,39 @@ def run_pipeline(
             )
 
         if pick_obj is None:
-            print(f"[Vision AI] Could not locate '{task.pick_phrase}' in current view.")
-            return None, None, candidates, None, None
+            print(f"[Vision AI] Could not locate Pick Object '{task.pick_phrase}' in current view.")
+            return None, place_obj, candidates, None, None
 
-        print(f"\n[AI Identified Target]  -> {pick_obj}")
-        print(f"  Match Reason: {pick_obj.reason}")
+        print(f"\n[AI Identified PICK Object]  -> {pick_obj}")
+        print(f"  Pick Match Reason  : {pick_obj.reason}")
 
         if place_obj is not None:
-            print(f"[AI Identified Place]   -> {place_obj}")
+            print(f"[AI Identified PLACE Object] -> {place_obj}")
+            print(f"  Place Match Reason : {place_obj.reason}")
             place_xyz = place_obj.robot_coords
         else:
             px, py, _ = pick_obj.robot_coords
             place_xyz = (round(min(25.0, max(15.0, px + 2.0)), 2), round(-py if abs(py) > 4.0 else -10.0, 2), 0.0)
-            print(f"[Default Place Target]  -> Drop Zone @ 3D Robot Frame: X={place_xyz[0]:+.1f}cm, Y={place_xyz[1]:+.1f}cm, Z=+0.0cm")
+            print(f"[Default Place Target]       -> Drop Zone @ 3D Robot Frame: X={place_xyz[0]:+.1f}cm, Y={place_xyz[1]:+.1f}cm, Z=+0.0cm")
 
         px, py, pz = pick_obj.robot_coords
+        lx, ly, lz = place_xyz
         ready_ik = solver.inverse_kinematics(px, py, config.Z_HOVER, gripper_closed=False)
         grasp_ik = solver.inverse_kinematics(px, py, config.Z_GRIP, gripper_closed=False)
+        place_ik = solver.inverse_kinematics(lx, ly, config.Z_PLACE, gripper_closed=True)
         fk_verify = solver.forward_kinematics(*grasp_ik.as_tuple())
 
         print("\n" + "=" * 108)
-        print(" AI IDENTIFIED OBJECT -> READY TO MOVE TELEMETRY:")
+        print(" AI IDENTIFIED PICK & PLACE OBJECTS -> READY TO MOVE TELEMETRY:")
         print("=" * 108)
-        print(f"  Identified Variable Object            : '{pick_obj.label}' (Confidence Score: {pick_obj.score:.2f})")
-        print(f"  Object 3D Position (Robot Base Frame) : X = {px:+6.2f} cm, Y = {py:+6.2f} cm, Z = {pz:+6.2f} cm")
+        print(f"  1) PICK Object ('{pick_obj.label}') 3D Coords   : X = {px:+6.2f} cm, Y = {py:+6.2f} cm, Z = {pz:+6.2f} cm (Score: {pick_obj.score:.2f})")
+        place_lbl = place_obj.label if place_obj else "Drop Zone"
+        place_sc = f"{place_obj.score:.2f}" if place_obj else "N/A"
+        print(f"  2) PLACE Object ('{place_lbl}') 3D Coords  : X = {lx:+6.2f} cm, Y = {ly:+6.2f} cm, Z = {lz:+6.2f} cm (Score: {place_sc})")
         print(f"  Ready/Hover Pose (APPROACH_PICK)      : X = {px:+6.2f} cm, Y = {py:+6.2f} cm, Z = {config.Z_HOVER:+6.2f} cm")
         print(f"  Ready Servo Angles (ESP32)            : B={ready_ik.servo_B} deg, S={ready_ik.servo_S} deg, E={ready_ik.servo_E} deg, W={ready_ik.servo_W} deg, C={ready_ik.servo_C} deg")
-        print(f"  Grasp Target Pose (DESCEND_PICK)      : X = {px:+6.2f} cm, Y = {py:+6.2f} cm, Z = {config.Z_GRIP:+6.2f} cm")
-        print(f"  Grasp Joint Angles (t1..t4)           : t1={grasp_ik.theta_1:+5.1f} deg, t2={grasp_ik.theta_2:+5.1f} deg, t3={grasp_ik.theta_3:+5.1f} deg, t4={grasp_ik.theta_4:+5.1f} deg")
-        print(f"  Grasp Servo Angles (0-180 deg)        : B={grasp_ik.servo_B} deg, S={grasp_ik.servo_S} deg, E={grasp_ik.servo_E} deg, W={grasp_ik.servo_W} deg, C={grasp_ik.servo_C} deg")
-        print(f"  ESP32 UART Command String             : \"{grasp_ik.serial_command()}\"")
+        print(f"  Grasp Servo Angles (DESCEND_PICK)     : B={grasp_ik.servo_B} deg, S={grasp_ik.servo_S} deg, E={grasp_ik.servo_E} deg, W={grasp_ik.servo_W} deg, C={grasp_ik.servo_C} deg")
+        print(f"  Place Servo Angles (DESCEND_PLACE)    : B={place_ik.servo_B} deg, S={place_ik.servo_S} deg, E={place_ik.servo_E} deg, W={place_ik.servo_W} deg, C={place_ik.servo_C} deg")
         print(f"  Forward Kinematics Verification       : X = {fk_verify[0]:+6.2f} cm, Y = {fk_verify[1]:+6.2f} cm, Z = {fk_verify[2]:+6.2f} cm")
         print("=" * 108)
 
@@ -158,8 +179,10 @@ def run_pipeline(
         )
         if plan.is_valid:
             plan.print_plan_table()
-            print(f"\n>>> [AI READY] Target '{pick_obj.label}' locked! Arm moving to APPROACH_PICK ready pose above X={px:+.1f}, Y={py:+.1f} cm.")
-            print(">>> Press [SPACE] in the GUI window to execute the Pick & Place movement!")
+            print(
+                f"\n>>> [AI READY] Pick='{pick_obj.label}' ({px:+.1f},{py:+.1f}cm) -> Place='{place_lbl}' ({lx:+.1f},{ly:+.1f}cm)!"
+            )
+            print(">>> Arm moved to APPROACH_PICK Ready Pose. Press [SPACE] in the GUI window to execute Pick & Place!")
         else:
             print(f"[Planner Error] {plan.error_message}")
 
@@ -171,7 +194,6 @@ def run_pipeline(
     initial_frame = static_frame.copy() if static_frame is not None else detector.get_frame()
     pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(initial_frame)
 
-    # Save annotated snapshot showing the arm positioned at the Ready-to-Move (APPROACH_PICK) / Grasp pose
     home_js = solver.home_joint_state()
     display_wp = current_plan.waypoints[1] if (current_plan and current_plan.is_valid) else Waypoint(
         1, "STANDBY_HOME", "Home", solver.forward_kinematics(*home_js.as_tuple()), home_js, "OPEN", 1.0
@@ -182,7 +204,7 @@ def run_pipeline(
         detected_objects=candidates,
         pick_obj=pick_obj,
         place_obj=place_obj,
-        status_msg=f"READY TO MOVE '{pick_obj.label.upper()}' [PRESS SPACE]" if pick_obj else "SEARCHING",
+        status_msg=f"READY TO MOVE '{pick_obj.label.upper()}' -> '{place_obj.label.upper() if place_obj else 'DROP ZONE'}'" if pick_obj else "SEARCHING",
         command_text=task.raw_command,
         current_angles=display_wp.joint_angles.as_tuple(),
         gripper_state=display_wp.gripper_state,
@@ -208,24 +230,23 @@ def run_pipeline(
     window_name = "Vision-Guided Robotic Arm Prototype - Live Demo"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-    print("\n[Interactive GUI Controls - Variable Object & Two-Stage Move]")
-    print("  [T] or [/]  : Type ANY variable object or command directly on-screen (e.g. 'yellow cup', 'black phone', 'orange mouse')")
-    print("  [SPACE]     : Execute Pick & Place Move (once AI is READY above object) or Re-run")
-    print("  [Mouse Drag]: Click & drag any object on the tabletop to variable (X, Y) coordinates!")
-    print("  [N]         : Randomize tabletop object coordinates & make AI re-identify and get ready")
-    print("  [1..6]      : Quick variable objects: [1] Red Bottle [2] Foam Board [3] Green Block [4] Yellow Cup [5] Black Phone [6] Desk Photo")
+    print("\n[Interactive GUI Controls - Manual Naming for BOTH Pick & Place Objects]")
+    print("  [T] or [/]  : 2-Step Manual Naming right on screen:")
+    print("                  Step 1 -> Type PICK Object name (e.g. 'yellow cup', 'black phone', '#1')")
+    print("                  Step 2 -> Type PLACE Object name (e.g. 'white breadboard', 'blue tray', '#2')")
+    print("  [P]         : Manually name ONLY the PICK Object (what to pick up)")
+    print("  [L]         : Manually name ONLY the PLACE Object (where to place it)")
+    print("  [SPACE]     : Execute Pick & Place Move (once AI is READY above Pick object)")
+    print("  [Mouse]     : Left-drag moves objects in Sim | Right-click any object to set as PLACE target")
+    print("  [N]         : Randomize tabletop object coordinates & make AI re-identify both objects")
+    print("  [1..6]      : Quick presets ([1] Bottle->Tray [2] Foam->Breadboard [3] Block->Tray [4] Cup->Breadboard [5] Phone->Tray [6] Desk Photo)")
     print("  [O]         : Run Deep OWLv2 Transformer Scan on current Live Webcam frame")
     print("  [S]         : Toggle Live Webcam / Synthetic Simulation Feed")
+    print("  [C]         : Type Pick & Place object names in Terminal")
     print("  [R]         : Reset Arm & Objects to Home Pose")
     print("  [Q / ESC]   : Quit Demo")
     print("-" * 108)
 
-    # Two-Stage Arm State Machine:
-    #   "IDLE"           : Arm at home, no valid target
-    #   "GETTING_READY"  : AI identified object; arm is moving to APPROACH_PICK hover pose above object
-    #   "READY_TO_MOVE"  : Arm is hovering right above the identified object, waiting for [SPACE] to pick & place
-    #   "EXECUTING_MOVE" : Arm is executing DESCEND_PICK -> GRASP -> LIFT -> TRANSIT -> PLACE -> HOME
-    #   "COMPLETED"      : Object placed in target tray
     arm_state = "IDLE"
     plan_step_idx = 0
     target_end_idx = 0
@@ -237,12 +258,30 @@ def run_pipeline(
     current_xyz = solver.forward_kinematics(*current_angles)
     status_msg = "SEARCHING FOR OBJECT"
 
-    typing_mode = False
+    # Typing state machine:
+    #   typing_stage == "": Not typing
+    #   typing_stage == "BOTH_STEP1_PICK": Step 1 of [T] (entering Pick object name)
+    #   typing_stage == "BOTH_STEP2_PLACE": Step 2 of [T] (entering Place object name)
+    #   typing_stage == "ONLY_PICK": [P] (entering Pick object name only)
+    #   typing_stage == "ONLY_PLACE": [L] (entering Place object name only)
+    typing_stage = ""
     typing_buffer = ""
+    pending_pick_name = ""
     dragging_sim_key = None
 
+    def get_typing_prompt() -> str:
+        if typing_stage == "BOTH_STEP1_PICK":
+            return "STEP 1/2 - NAME OBJECT TO PICK UP (e.g. 'red bottle', 'black phone', '#1') [ENTER]:"
+        elif typing_stage == "BOTH_STEP2_PLACE":
+            return f"STEP 2/2 - NAME OBJECT WHERE '{pending_pick_name.upper()}' CAN BE PLACED (e.g. 'white breadboard', 'blue tray', '#2'):"
+        elif typing_stage == "ONLY_PICK":
+            return f"NAME OBJECT TO PICK UP (current Place: '{task.place_phrase or 'drop zone'}') [ENTER]:"
+        elif typing_stage == "ONLY_PLACE":
+            return f"NAME OBJECT WHERE '{task.pick_phrase.upper()}' CAN BE PLACED (e.g. 'white breadboard', 'blue tray') [ENTER]:"
+        return ""
+
     def start_get_ready():
-        """Stage 1: Move arm from current pose to Waypoint 1 (APPROACH_PICK hover right above identified object)."""
+        """Stage 1: Move arm from current pose to Waypoint 1 (APPROACH_PICK hover right above identified Pick object)."""
         nonlocal arm_state, plan_step_idx, target_end_idx, interp_substeps, substep_idx, status_msg
         if current_plan and current_plan.is_valid and pick_obj is not None:
             arm_state = "GETTING_READY"
@@ -252,10 +291,11 @@ def run_pipeline(
             start_wp = Waypoint(0, "CURRENT", "Current", current_xyz, curr_js, current_gripper, 0.5)
             interp_substeps = planner.interpolate_trajectory(start_wp, current_plan.waypoints[1], steps=16)
             substep_idx = 0
-            status_msg = f"AI LOCKED '{pick_obj.label.upper()}' -> MOVING TO READY POSE"
+            dst_lbl = place_obj.label.upper() if place_obj else "DROP ZONE"
+            status_msg = f"AI LOCKED '{pick_obj.label.upper()}' -> '{dst_lbl}' | MOVING TO READY POSE"
         else:
             arm_state = "IDLE"
-            status_msg = f"NOT FOUND: '{task.pick_phrase}' (PRESS [T] TO TYPE OR [S] FOR SIM)"
+            status_msg = f"NOT FOUND: '{task.pick_phrase}' (PRESS [T] TO NAME PICK & PLACE)"
 
     def start_execute_move():
         """Stage 2: Execute pick-and-place from APPROACH_PICK through RETURN_HOME."""
@@ -268,25 +308,52 @@ def run_pipeline(
             start_wp = Waypoint(1, "READY", "Ready", current_xyz, curr_js, current_gripper, 0.5)
             interp_substeps = planner.interpolate_trajectory(start_wp, current_plan.waypoints[2], steps=14)
             substep_idx = 0
-            status_msg = f"MOVING '{pick_obj.label.upper()}' TO TARGET"
+            dst_lbl = place_obj.label.upper() if place_obj else "TARGET"
+            status_msg = f"MOVING '{pick_obj.label.upper()}' -> '{dst_lbl}'"
 
-    # Mouse callback for dragging objects to variable positions on the tabletop
+    # Mouse callback: Left-drag moves objects in Sim (or selects Pick on webcam); Right-click selects Place object
     def on_mouse(event, x, y, flags, param):
-        nonlocal dragging_sim_key, pick_obj, place_obj, candidates, current_plan, place_xyz
-        if not detector.use_simulation or static_frame is not None or x >= config.FRAME_WIDTH:
+        nonlocal dragging_sim_key, pick_obj, place_obj, candidates, current_plan, place_xyz, task
+        if x >= config.FRAME_WIDTH:
             return
-        if event == cv2.EVENT_LBUTTONDOWN:
-            hit_key = detector.get_sim_object_at_pixel(x, y)
-            if hit_key:
-                dragging_sim_key = hit_key
-        elif event == cv2.EVENT_MOUSEMOVE and dragging_sim_key is not None:
-            detector.move_sim_object(dragging_sim_key, x, y)
-        elif event == cv2.EVENT_LBUTTONUP and dragging_sim_key is not None:
-            detector.move_sim_object(dragging_sim_key, x, y)
-            dragging_sim_key = None
-            frame_now = detector.get_frame()
-            pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame_now)
-            start_get_ready()
+        if detector.use_simulation and static_frame is None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                hit_key = detector.get_sim_object_at_pixel(x, y)
+                if hit_key:
+                    dragging_sim_key = hit_key
+            elif event == cv2.EVENT_MOUSEMOVE and dragging_sim_key is not None:
+                detector.move_sim_object(dragging_sim_key, x, y)
+            elif event == cv2.EVENT_LBUTTONUP and dragging_sim_key is not None:
+                detector.move_sim_object(dragging_sim_key, x, y)
+                dragging_sim_key = None
+                frame_now = detector.get_frame()
+                pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame_now)
+                start_get_ready()
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                hit_key = detector.get_sim_object_at_pixel(x, y)
+                if hit_key and hit_key in detector.sim_objects:
+                    clicked_label = detector.sim_objects[hit_key].label
+                    task = cmd_parser.create_task(task.pick_phrase, clicked_label)
+                    print(f"\n[Mouse Select] Set PLACE target to '{clicked_label}': {task}")
+                    frame_now = detector.get_frame()
+                    pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame_now)
+                    start_get_ready()
+        else:
+            # On IRL webcam or static photo: Left-click selects Pick candidate, Right-click selects Place candidate
+            if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN) and candidates:
+                for idx, cand in enumerate(candidates, start=1):
+                    bx, by, bw, bh = cand.bbox
+                    if bx <= x <= bx + bw and by <= y <= by + bh:
+                        if event == cv2.EVENT_LBUTTONDOWN:
+                            task = cmd_parser.create_task(f"#{idx}", task.place_phrase)
+                            print(f"\n[Mouse Select] Selected Candidate #{idx} as PICK target.")
+                        else:
+                            task = cmd_parser.create_task(task.pick_phrase, f"#{idx}")
+                            print(f"\n[Mouse Select] Selected Candidate #{idx} as PLACE target.")
+                        frame_now = static_frame.copy() if static_frame is not None else detector.get_frame()
+                        pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame_now)
+                        start_get_ready()
+                        break
 
     cv2.setMouseCallback(window_name, on_mouse)
 
@@ -329,10 +396,10 @@ def run_pipeline(
                             pick_obj.robot_coords = current_xyz
                 else:
                     if arm_state == "GETTING_READY":
-                        # Reached APPROACH_PICK hover position! Pause and wait for user to trigger move
                         arm_state = "READY_TO_MOVE"
                         obj_name = pick_obj.label.upper() if pick_obj else "OBJECT"
-                        status_msg = f"READY TO MOVE '{obj_name}' - PRESS [SPACE] TO PICK & PLACE"
+                        dst_name = place_obj.label.upper() if place_obj else "DROP ZONE"
+                        status_msg = f"READY TO MOVE '{obj_name}' -> '{dst_name}' [PRESS SPACE]"
                     elif arm_state == "EXECUTING_MOVE":
                         plan_step_idx += 1
                         if plan_step_idx <= target_end_idx:
@@ -342,8 +409,9 @@ def run_pipeline(
                         else:
                             arm_state = "COMPLETED"
                             detector.carried_sim_key = None
-                            status_msg = "OBJECT PLACED! PRESS [T] FOR NEW OBJECT OR [N] RANDOMIZE"
-                            print("\n[Pipeline] Pick-and-Place complete! Object placed in destination.")
+                            dst_name = place_obj.label.upper() if place_obj else "TARGET"
+                            status_msg = f"PLACED ON '{dst_name}'! PRESS [T] TO NAME NEW PICK & PLACE"
+                            print(f"\n[Pipeline] Pick-and-Place complete! Object placed on '{dst_name}'.")
             elif arm_state == "READY_TO_MOVE":
                 phase_label = "APPROACH_PICK (READY)"
                 step_progress = (2, 10)
@@ -354,17 +422,16 @@ def run_pipeline(
             # Acquire frame AFTER updating simulation object position
             frame = static_frame.copy() if static_frame is not None else detector.get_frame()
 
-            # On live webcam (when not executing a move), continuously track variable object every 20 frames
+            # On live webcam (when not executing a move), continuously track both Pick & Place objects every 20 frames
             if (
                 static_frame is None
                 and not detector.use_simulation
                 and arm_state not in ("EXECUTING_MOVE", "GETTING_READY")
                 and (live_frame_counter % 20 == 0)
             ):
-                new_pick, new_cands = detector.locate_by_query(frame, task.pick_phrase)
+                new_pick, new_cands = detector.locate_by_query(frame, task.pick_phrase, is_receptacle=False)
                 candidates = new_cands
                 if new_pick is not None:
-                    # If target moved significantly on live webcam, update plan and ready position
                     moved_dist = (
                         np.hypot(
                             new_pick.robot_coords[0] - pick_obj.robot_coords[0],
@@ -375,7 +442,9 @@ def run_pipeline(
                     )
                     pick_obj = new_pick
                     if task.place_phrase:
-                        place_obj, _ = detector.locate_by_query(frame, task.place_phrase, exclude_bbox=pick_obj.bbox)
+                        place_obj, _ = detector.locate_by_query(
+                            frame, task.place_phrase, exclude_bbox=pick_obj.bbox, is_receptacle=True
+                        )
                     if moved_dist > 1.8 or current_plan is None:
                         pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
                         start_get_ready()
@@ -389,8 +458,9 @@ def run_pipeline(
                 command_text=task.raw_command,
                 current_angles=current_angles,
                 gripper_state=current_gripper,
-                typing_mode=typing_mode,
+                typing_mode=bool(typing_stage),
                 typing_buffer=typing_buffer,
+                typing_prompt=get_typing_prompt(),
             )
             tel_panel = visualizer.draw_telemetry_panel(
                 current_angles=current_angles,
@@ -408,27 +478,64 @@ def run_pipeline(
             if key == 255:
                 continue
 
-            # Handle On-Screen Typing Mode for Variable Objects/Commands
-            if typing_mode:
+            # Handle On-Screen Manual Naming Mode ([T], [P], [L])
+            if typing_stage:
                 if key == 27:  # ESC cancels typing
-                    typing_mode = False
+                    typing_stage = ""
                     typing_buffer = ""
-                elif key in (13, 10):  # ENTER submits variable object/command
-                    typing_mode = False
-                    new_cmd = typing_buffer.strip()
+                elif key in (13, 10):  # ENTER confirms current input field
+                    entered = typing_buffer.strip()
                     typing_buffer = ""
-                    if new_cmd:
-                        # If user typed just an object name like "yellow cup", default to placing in blue tray
-                        if "place" not in new_cmd.lower() and "put" not in new_cmd.lower() and " to " not in new_cmd.lower():
-                            full_cmd = f"Pick up the {new_cmd} and place it in the blue tray."
+
+                    if typing_stage == "BOTH_STEP1_PICK":
+                        if not entered:
+                            typing_stage = ""
                         else:
-                            full_cmd = new_cmd
-                        task = cmd_parser.parse(full_cmd)
-                        print(f"\n[Variable Query] {task}")
+                            # Check if user typed a full two-part command in Step 1 (e.g. "red bottle -> white breadboard")
+                            parsed_try = cmd_parser.parse(entered)
+                            if parsed_try.is_two_object_task and parsed_try.place_phrase:
+                                typing_stage = ""
+                                task = parsed_try
+                                print(f"\n[Manual Naming] {task}")
+                                ensure_variable_sim_objects()
+                                frame = static_frame.copy() if static_frame is not None else detector.get_frame()
+                                pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
+                                start_get_ready()
+                            else:
+                                # Proceed to Step 2 so user can manually name the PLACE object!
+                                pending_pick_name = entered
+                                typing_stage = "BOTH_STEP2_PLACE"
+
+                    elif typing_stage == "BOTH_STEP2_PLACE":
+                        typing_stage = ""
+                        place_entered = entered if entered else (task.place_phrase or "blue tray")
+                        task = cmd_parser.create_task(pending_pick_name, place_entered)
+                        print(f"\n[Manual Naming] Pick='{task.pick_phrase}' -> Place='{task.place_phrase}'")
                         ensure_variable_sim_objects()
                         frame = static_frame.copy() if static_frame is not None else detector.get_frame()
                         pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
                         start_get_ready()
+
+                    elif typing_stage == "ONLY_PICK":
+                        typing_stage = ""
+                        if entered:
+                            task = cmd_parser.create_task(entered, task.place_phrase or "blue tray")
+                            print(f"\n[Manual Pick Name] Updated Pick='{task.pick_phrase}' (Place='{task.place_phrase}')")
+                            ensure_variable_sim_objects()
+                            frame = static_frame.copy() if static_frame is not None else detector.get_frame()
+                            pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
+                            start_get_ready()
+
+                    elif typing_stage == "ONLY_PLACE":
+                        typing_stage = ""
+                        if entered:
+                            task = cmd_parser.create_task(task.pick_phrase, entered)
+                            print(f"\n[Manual Place Name] Updated Place='{task.place_phrase}' (Pick='{task.pick_phrase}')")
+                            ensure_variable_sim_objects()
+                            frame = static_frame.copy() if static_frame is not None else detector.get_frame()
+                            pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
+                            start_get_ready()
+
                 elif key in (8, 127):  # Backspace
                     typing_buffer = typing_buffer[:-1]
                 elif 32 <= key <= 126 and len(typing_buffer) < 52:
@@ -440,15 +547,21 @@ def run_pipeline(
                 break
 
             elif key in (ord("t"), ord("T"), ord("/")):
-                typing_mode = True
+                typing_stage = "BOTH_STEP1_PICK"
+                typing_buffer = ""
+
+            elif key in (ord("p"), ord("P")):
+                typing_stage = "ONLY_PICK"
+                typing_buffer = ""
+
+            elif key in (ord("l"), ord("L")):
+                typing_stage = "ONLY_PLACE"
                 typing_buffer = ""
 
             elif key in (ord(" "), ord("m"), ord("M")):
                 if arm_state == "READY_TO_MOVE":
-                    # Stage 2: Execute the Pick & Place move!
                     start_execute_move()
                 else:
-                    # If completed or idle, re-identify and get ready (or if already at home, get ready first)
                     if detector.use_simulation and static_frame is None and arm_state == "COMPLETED":
                         detector.reset_sim_objects()
                         ensure_variable_sim_objects()
@@ -457,7 +570,6 @@ def run_pipeline(
                     start_get_ready()
 
             elif key in (ord("n"), ord("N")):
-                # Randomize tabletop object positions so coordinates are completely variable
                 static_frame = None
                 detector.use_simulation = True
                 detector.randomize_sim_objects()
@@ -469,17 +581,18 @@ def run_pipeline(
 
             elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
                 preset_map = {
-                    ord("1"): "Pick up the red bottle and place it in the blue tray.",
-                    ord("2"): "Pick up the white mixed foam board and place it in the blue tray.",
-                    ord("3"): "Pick up the green block and place it in the blue tray.",
-                    ord("4"): "Pick up the yellow cup and place it in the blue tray.",
-                    ord("5"): "Pick up the black phone and place it in the blue tray.",
+                    ord("1"): ("red bottle", "blue tray"),
+                    ord("2"): ("white mixed foam board", "white breadboard"),
+                    ord("3"): ("green block", "blue tray"),
+                    ord("4"): ("yellow cup", "white breadboard"),
+                    ord("5"): ("black phone", "blue tray"),
                 }
                 static_frame = None
                 detector.use_simulation = True
+                p_name, d_name = preset_map[key]
+                task = cmd_parser.create_task(p_name, d_name)
                 ensure_variable_sim_objects()
-                task = cmd_parser.parse(preset_map[key])
-                print(f"\n[Variable Target] Switched target object: {task}")
+                print(f"\n[Preset] Switched Pick & Place targets: {task}")
                 frame = detector.get_frame()
                 pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
                 start_get_ready()
@@ -489,7 +602,7 @@ def run_pipeline(
                 if p_path.exists():
                     static_frame = cv2.imread(str(p_path))
                     detector.use_simulation = False
-                    task = cmd_parser.parse("Pick up the white mixed foam board and place it on the white breadboard")
+                    task = cmd_parser.create_task("white mixed foam board", "white breadboard")
                     print(f"\n[Preset] Loaded Real Desk Photo {p_path}: {task}")
                     pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(static_frame)
                     start_get_ready()
@@ -531,19 +644,19 @@ def run_pipeline(
                 start_get_ready()
 
             elif key in (ord("c"), ord("C")):
-                print("\n" + "=" * 60)
-                print("Enter any variable object or command (e.g., 'orange calculator', 'Pick up the yellow cup'):")
+                print("\n" + "=" * 72)
+                print("MANUAL OBJECT NAMING (Leave blank to keep current value):")
                 try:
-                    new_cmd = input("Command >> ").strip()
-                    if new_cmd:
-                        if "place" not in new_cmd.lower() and "put" not in new_cmd.lower() and " to " not in new_cmd.lower():
-                            new_cmd = f"Pick up the {new_cmd} and place it in the blue tray."
-                        task = cmd_parser.parse(new_cmd)
-                        print(f"[NLP] {task}")
-                        ensure_variable_sim_objects()
-                        frame = static_frame.copy() if static_frame is not None else detector.get_frame()
-                        pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
-                        start_get_ready()
+                    p_in = input(f"  1) Enter PICK Object Name  [{task.pick_phrase}]: ").strip()
+                    d_in = input(f"  2) Enter PLACE Object Name [{task.place_phrase or 'blue tray'}]: ").strip()
+                    new_p = p_in if p_in else task.pick_phrase
+                    new_d = d_in if d_in else (task.place_phrase or "blue tray")
+                    task = cmd_parser.create_task(new_p, new_d)
+                    print(f"[NLP] {task}")
+                    ensure_variable_sim_objects()
+                    frame = static_frame.copy() if static_frame is not None else detector.get_frame()
+                    pick_obj, place_obj, candidates, current_plan, place_xyz = detect_and_plan(frame)
+                    start_get_ready()
                 except Exception as e:
                     print(f"[Input Error] {e}")
     finally:
@@ -559,8 +672,10 @@ def main():
         dest="query",
         type=str,
         default="Pick up the red bottle and place it in the blue tray.",
-        help="Any variable natural language command or object query",
+        help="Natural language command or shorthand 'pick_obj -> place_obj'",
     )
+    ap.add_argument("--pick", type=str, default=None, help="Manually specify the Pick object name (e.g. 'yellow cup')")
+    ap.add_argument("--place", type=str, default=None, help="Manually specify the Place object name (e.g. 'white breadboard')")
     ap.add_argument("--image", type=str, default="", help="Optional static image path (e.g. 5-DOF-Robotic-Arm-Basic/foam.png)")
     ap.add_argument("--webcam", type=int, default=0, help="Webcam device index (default 0)")
     ap.add_argument("--sim", action="store_true", help="Start in synthetic tabletop simulation mode")
@@ -569,6 +684,8 @@ def main():
 
     run_pipeline(
         query=args.query,
+        pick_manual=args.pick,
+        place_manual=args.place,
         image_path_str=args.image,
         webcam_index=args.webcam,
         use_simulation=args.sim,

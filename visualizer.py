@@ -42,6 +42,7 @@ class DashboardVisualizer:
         gripper_state: str = "OPEN",
         typing_mode: bool = False,
         typing_buffer: str = "",
+        typing_prompt: str = "",
     ) -> np.ndarray:
         """Overlays bounding boxes, 3D coordinates, planned path, and live top-down arm on camera frame."""
         if frame.shape[1] != self.cam_w or frame.shape[0] != self.height:
@@ -234,17 +235,18 @@ class DashboardVisualizer:
             cv2.LINE_AA,
         )
 
-        # Interactive On-Screen Typing Bar (when user presses [T] to type a variable object)
+        # Interactive On-Screen Typing Bar (when user presses [T], [P], or [L] to manually name objects)
         if typing_mode:
-            bar_y1, bar_y2 = self.height // 2 - 38, self.height // 2 + 38
+            bar_y1, bar_y2 = self.height // 2 - 42, self.height // 2 + 42
             overlay_bar = vis.copy()
-            cv2.rectangle(overlay_bar, (30, bar_y1), (self.cam_w - 30, bar_y2), (15, 20, 30), -1)
+            cv2.rectangle(overlay_bar, (24, bar_y1), (self.cam_w - 24, bar_y2), (15, 20, 30), -1)
             cv2.addWeighted(overlay_bar, 0.92, vis, 0.08, 0, vis)
-            cv2.rectangle(vis, (30, bar_y1), (self.cam_w - 30, bar_y2), (0, 215, 255), 2)
+            cv2.rectangle(vis, (24, bar_y1), (self.cam_w - 24, bar_y2), (0, 215, 255), 2)
+            header_txt = typing_prompt or "TYPE OBJECT NAME OR COMMAND (ENTER to Confirm, ESC to Cancel):"
             cv2.putText(
                 vis,
-                "TYPE VARIABLE OBJECT OR COMMAND (Press ENTER to Identify, ESC to Cancel):",
-                (44, bar_y1 + 24),
+                header_txt,
+                (38, bar_y1 + 26),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.40,
                 (180, 230, 255),
@@ -254,7 +256,7 @@ class DashboardVisualizer:
             cv2.putText(
                 vis,
                 f"> {typing_buffer}_",
-                (44, bar_y1 + 56),
+                (38, bar_y1 + 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.56,
                 (0, 255, 120),
@@ -501,7 +503,7 @@ class DashboardVisualizer:
         cv2.rectangle(panel, (0, self.height - 26), (self.telemetry_w, self.height), (18, 18, 18), -1)
         cv2.putText(
             panel,
-            "[T] Type Object [SPACE] Move [N] Randomize [Drag] Move Obj [1-6] Presets [S] Sim/Cam",
+            "[T] Name Both [P] Pick Name [L] Place Name [SPACE] Move [N] Random [S] Sim/Cam",
             (8, self.height - 8),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.32,

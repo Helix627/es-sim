@@ -252,11 +252,14 @@ class VisionDetector:
             return existing
 
         clean = phrase.lower().strip()
-        color_found = "orange" if not is_receptacle else "blue"
-        for cname in COLOR_BGR_MAP:
-            if cname in clean or (cname == "grey" and "gray" in clean):
-                color_found = cname
-                break
+        color_found = "orange" if not is_receptacle else "brown"
+        if "cardboard" in clean or "wood" in clean:
+            color_found = "brown"
+        else:
+            for cname in COLOR_BGR_MAP:
+                if cname in clean or (cname == "grey" and "gray" in clean):
+                    color_found = cname
+                    break
 
         bgr = COLOR_BGR_MAP.get(color_found, (30, 140, 240))
         key = clean.replace(" ", "_")
@@ -266,20 +269,20 @@ class VisionDetector:
         candidate_slots = (
             [(365, 305), (200, 225), (310, 225), (195, 375), (365, 380)]
             if not is_receptacle
-            else [(505, 305), (490, 145)]
+            else [(495, 115), (370, 380)]
         )
         pos = candidate_slots[0]
         found_slot = False
         for slot in candidate_slots:
-            if all(np.hypot(slot[0] - px, slot[1] - py) > 78 for px, py in existing_pts):
+            if all(np.hypot(slot[0] - px, slot[1] - py) > 88 for px, py in existing_pts):
                 pos = slot
                 found_slot = True
                 break
         if not found_slot:
             for _ in range(60):
-                cand_x = random.randint(105, 375) if not is_receptacle else random.randint(430, 540)
-                cand_y = random.randint(135, 380)
-                if all(np.hypot(cand_x - px, cand_y - py) > 80 for px, py in existing_pts):
+                cand_x = random.randint(105, 375) if not is_receptacle else random.randint(380, 540)
+                cand_y = random.randint(115, 380)
+                if all(np.hypot(cand_x - px, cand_y - py) > 88 for px, py in existing_pts):
                     pos = (cand_x, cand_y)
                     break
 
@@ -295,7 +298,7 @@ class VisionDetector:
         elif "breadboard" in clean:
             style = "breadboard"
 
-        size = (52, 40) if is_receptacle else (28, 32)
+        size = (48, 34) if is_receptacle else (28, 32)
         self.sim_objects[key] = SimObject(
             key=key,
             label=clean,
@@ -722,11 +725,34 @@ class VisionDetector:
         area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
         return float(inter) / float(area_a + area_b - inter)
 
-    def _score_proposal_for_query(self, prop: Dict[str, Any], query: str, img_shape: Tuple[int, int, int]) -> Tuple[float, str, str]:
+    @staticmethod
+    def _describe_proposal_visually(f: Dict[str, float], bbox: Tuple[int, int, int, int], img_area: float) -> Tuple[str, str]:
+        """Generates a human-readable visual label and dominant color for any real-world detected object."""
+        best_col = "grey"
+        best_val = 0.0
+        for cname in ["red", "blue", "green", "yellow", "orange", "brown", "white", "black", "grey"]:
+            val = f.get(cname, 0.0)
+            if val > best_val:
+                best_val = val
+                best_col = cname
+        _, _, w, h = bbox
+        rel_area = (w * h) / max(1.0, img_area)
+        size_word = "large" if rel_area > 0.055 else ("small" if rel_area < 0.015 else "tabletop")
+        disp_col = "orange" if best_col == "brown" else best_col
+        return f"{best_col} {size_word} object", disp_col
+
+    def _score_proposal_for_query(
+        self,
+        prop: Dict[str, Any],
+        query: str,
+        img_shape: Tuple[int, int, int],
+        is_receptacle: bool = False,
+    ) -> Tuple[float, str, str]:
         q = query.lower().strip()
         f = prop["features"]
         x, y, w, h = prop["bbox"]
         img_h, img_w = img_shape[:2]
+        img_area = float(img_w * img_h)
 
         # In simulation mode, check matching against dynamic SimObjects
         if self.use_simulation:
@@ -744,9 +770,9 @@ class VisionDetector:
                 if np.hypot(cx - sobj.pos[0], cy - sobj.pos[1]) < max(sobj.size) * 1.1:
                     return 0.98, sobj.color_name, f"AI grounded '{sobj.label}' ({sobj.shape_style}, {sobj.color_name})."
 
+        auto_desc, dom_color = self._describe_proposal_visually(f, (x, y, w, h), img_area)
         score = 0.25
-        reason = f"Matched tabletop object candidate at ({x}, {y}, {x+w}, {y+h})."
-        dom_color = "target"
+        reason = f"Detected {auto_desc} at ({x}, {y}, {x+w}, {y+h})."
 
         if "mixed" in q and "foam" in q:
             if f["dark_ratio"] > 0.30 and (f["bottom_white_ratio"] > 0.08 or (0.04 <= f["white_ratio"] <= 0.45)):
@@ -799,37 +825,61 @@ class VisionDetector:
                 score = 0.15
             return round(min(0.99, score), 2), dom_color, reason
 
-        if "cardboard" in q:
-            if f["brown"] > 0.20 and w * h > (img_w * img_h * 0.03):
-                score = 0.90
+        if "cardboard" in q or "wood" in q or "brown" in q:
+            if f["brown"] > 0.16:
+                score = 0.88 + 0.10 * min(1.0, (w * h) / (img_area * 0.05))
                 dom_color = "orange"
-                reason = f"Corrugated tan/brown cardboard box ({f['brown']*100:.0f}% cardboard tone)."
+                reason = f"Tan/brown surface matching '{query}' ({f['brown']*100:.0f}% brown/cardboard tone)."
             else:
                 score = 0.15
             return round(min(0.99, score), 2), dom_color, reason
 
-        if "phone" in q:
-            if f["black"] > 0.35 or f["grey"] > 0.35:
-                score = 0.91
+        if "phone" in q or "calculator" in q or "remote" in q or "mouse" in q:
+            if f["black"] > 0.30 or f["grey"] > 0.30:
+                score = 0.89
                 dom_color = "black"
-                reason = f"Dark rectangular device profile matching '{query}'."
+                reason = f"Dark device profile matching '{query}'."
                 return round(score, 2), dom_color, reason
 
+        # Explicit color keyword matching
         for cname in ["red", "blue", "green", "yellow", "orange", "white", "black", "grey"]:
             if cname in q or (cname == "grey" and "gray" in q):
                 c_ratio = f.get(cname, 0.0)
                 if c_ratio > 0.10:
-                    score = 0.62 + 0.37 * min(1.0, c_ratio / 0.50)
+                    score = 0.65 + 0.34 * min(1.0, c_ratio / 0.50)
                     dom_color = cname
-                    reason = f"Matched {cname} object ({c_ratio*100:.0f}% {cname} pixels in region)."
+                    reason = f"Matched '{query}' ({c_ratio*100:.0f}% {cname} pixels in region)."
                 else:
                     score = 0.08
                 return round(min(0.99, score), 2), dom_color, reason
 
+        # Spatial & Role/Size cues when user manually names an object without a color word
         cx, cy = prop["center"]
+        rel_area = (w * h) / max(1.0, img_area)
         dist_center = np.hypot((cx - img_w * 0.5) / img_w, (cy - img_h * 0.5) / img_h)
-        score = max(0.38, 0.72 - 0.45 * float(dist_center))
-        return round(score, 2), dom_color, reason
+        score = max(0.40, 0.72 - 0.40 * float(dist_center))
+
+        if "left" in q and cx < img_w * 0.48:
+            score += 0.22
+            reason = f"Left-side tabletop object matching '{query}'."
+        elif "right" in q and cx > img_w * 0.52:
+            score += 0.22
+            reason = f"Right-side tabletop object matching '{query}'."
+
+        receptacle_words = ("tray", "plate", "mat", "pad", "notebook", "book", "paper", "coaster", "container", "bowl", "box", "large", "big", "wide")
+        wants_receptacle = is_receptacle or any(rw in q for rw in receptacle_words)
+        if wants_receptacle:
+            # Prefer larger/wider objects as place targets
+            size_bonus = min(0.22, rel_area * 2.5)
+            score += size_bonus
+            reason = f"Place target '{query}' matched to {auto_desc} (area {w}x{h}px)."
+        else:
+            # Prefer compact graspable objects as pick targets
+            compact_bonus = 0.15 if (0.004 <= rel_area <= 0.055) else 0.0
+            score += compact_bonus
+            reason = f"Pick target '{query}' matched to {auto_desc} (size {w}x{h}px)."
+
+        return round(min(0.98, score), 2), dom_color, reason
 
     def find_sim_object_key_for_query_match(self, query: str) -> Optional[str]:
         return self.find_sim_object_key_for_phrase(query)
@@ -840,10 +890,11 @@ class VisionDetector:
         query: str,
         exclude_bbox: Optional[Tuple[int, int, int, int]] = None,
         use_owlv2: bool = True,
+        is_receptacle: bool = False,
     ) -> Tuple[Optional[DetectedObject], List[DetectedObject]]:
         """
-        Finds the best matching object for ANY open-vocabulary `query` and returns
-        both the top match and all numbered candidate objects in the scene.
+        Finds the best matching object for ANY open-vocabulary `query` (including manual names
+        or `#ID` numbers) and returns both the top match and all numbered candidate objects.
         """
         img_h, img_w = frame.shape[:2]
         if self.calibrator.frame_w != img_w or self.calibrator.frame_h != img_h:
@@ -856,7 +907,7 @@ class VisionDetector:
 
         # 2. Multi-cue tabletop segmentation proposals
         proposals = self.propose_tabletop_objects(frame, max_proposals=8)
-        q_lower = query.lower()
+        q_lower = query.lower().strip()
         for cname in ["red", "blue", "green", "yellow", "orange"]:
             if cname in q_lower:
                 col_objs = self.detect_objects_by_color(frame, [cname]).get(cname, [])
@@ -878,12 +929,14 @@ class VisionDetector:
                 if self._iou_xyxy(prop["box_xyxy"], ex_xyxy) > 0.5:
                     continue
 
-            sc, col_tag, reason = self._score_proposal_for_query(prop, query, frame.shape)
+            sc, col_tag, reason = self._score_proposal_for_query(prop, query, frame.shape, is_receptacle=is_receptacle)
             cx, cy = prop["center"]
             rx, ry, rz = self.calibrator.pixel_to_robot(cx, cy, z=0.0)
-            cand_label = query
             if self.use_simulation and prop.get("sim_key") in self.sim_objects:
                 cand_label = self.sim_objects[prop["sim_key"]].label
+            else:
+                auto_desc, _ = self._describe_proposal_visually(prop["features"], prop["bbox"], float(img_w * img_h))
+                cand_label = query if sc >= 0.60 else auto_desc
             cv_candidates.append(
                 DetectedObject(
                     color=col_tag,
@@ -905,7 +958,19 @@ class VisionDetector:
             if len(merged) >= 8:
                 break
 
-        best = merged[0] if (merged and merged[0].score >= 0.35) else None
+        # Support direct #ID selection (e.g. "#1", "1", "object 2")
+        id_match = None
+        q_digits = q_lower.lstrip("#").replace("object", "").replace("obj", "").strip()
+        if q_digits.isdigit():
+            idx_num = int(q_digits) - 1
+            if 0 <= idx_num < len(merged):
+                id_match = merged[idx_num]
+                id_match.score = 0.99
+                id_match.label = f"object #{idx_num + 1}"
+
+        best = id_match if id_match is not None else (merged[0] if (merged and merged[0].score >= 0.35) else None)
+        if best is not None and not q_digits.isdigit():
+            best.label = query
         return best, merged
 
     def detect_objects_by_color(
